@@ -5,11 +5,18 @@ Simple read access to stored health data.
 from http.server import BaseHTTPRequestHandler
 from upstash_redis import Redis
 from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Vercel runtimes are >=3.9
+    ZoneInfo = None
 from urllib.parse import parse_qs, urlparse
+import hmac
 import json
 import os
 
 API_KEY = os.environ.get("API_KEY", "")
+TIMEZONE = os.environ.get("TIMEZONE", "UTC")
+MAX_DAYS = 90
 
 redis = Redis(
     url=os.environ.get("UPSTASH_REDIS_REST_URL"),
@@ -17,11 +24,23 @@ redis = Redis(
 )
 
 
+def local_now() -> datetime:
+    """Current time in TIMEZONE (default UTC). Vercel functions run in UTC, so
+    without this, dates can land on the wrong calendar day for users outside UTC."""
+    if ZoneInfo is None:
+        return datetime.utcnow()
+    try:
+        return datetime.now(ZoneInfo(TIMEZONE))
+    except Exception:
+        return datetime.now(ZoneInfo("UTC"))
+
+
 def check_auth(headers) -> bool:
+    """Fail-closed: refuses every request if API_KEY isn't configured."""
     if not API_KEY:
-        return True
+        return False
     auth = headers.get("Authorization", "")
-    return auth == f"Bearer {API_KEY}"
+    return hmac.compare_digest(auth, f"Bearer {API_KEY}")
 
 
 class handler(BaseHTTPRequestHandler):
@@ -35,14 +54,18 @@ class handler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        days = int(query.get("days", [7])[0])
+        try:
+            days = int(query.get("days", [7])[0])
+        except ValueError:
+            days = 7
+        days = max(1, min(days, MAX_DAYS))
 
         results = {}
         for i in range(days):
-            date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
-            data = redis.get(f"health:{date}")
-            if data:
-                results[date] = json.loads(data)
+            date = (local_now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            raw = redis.hgetall(f"health:{date}") or {}
+            if raw:
+                results[date] = {field: json.loads(value) for field, value in raw.items()}
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

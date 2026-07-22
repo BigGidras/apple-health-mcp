@@ -5,12 +5,19 @@ Exposes health metrics to Claude via Model Context Protocol.
 from http.server import BaseHTTPRequestHandler
 from upstash_redis import Redis
 from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Vercel runtimes are >=3.9
+    ZoneInfo = None
 from urllib.parse import urlparse, parse_qs
+import hmac
 import json
 import os
 
 MCP_SECRET = os.environ.get("MCP_SECRET", "")
+TIMEZONE = os.environ.get("TIMEZONE", "UTC")
 EXERCISE_DAYS_PER_WEEK = os.environ.get("EXERCISE_DAYS_PER_WEEK", "")
+MAX_DAYS = 90
 
 redis = Redis(
     url=os.environ.get("UPSTASH_REDIS_REST_URL"),
@@ -18,11 +25,29 @@ redis = Redis(
 )
 
 
+def local_now() -> datetime:
+    """Current time in TIMEZONE (default UTC). Vercel functions run in UTC, so
+    without this, 'today'/'yesterday' can land on the wrong calendar day for
+    users outside UTC."""
+    if ZoneInfo is None:
+        return datetime.utcnow()
+    try:
+        return datetime.now(ZoneInfo(TIMEZONE))
+    except Exception:
+        return datetime.now(ZoneInfo("UTC"))
+
+
+def clamp_days(days: int, maximum: int = MAX_DAYS) -> int:
+    return max(1, min(days, maximum))
+
+
 def check_secret(path: str) -> bool:
+    """Fail-closed: refuses every request if MCP_SECRET isn't configured."""
     if not MCP_SECRET:
-        return True
+        return False
     query = parse_qs(urlparse(path).query)
-    return query.get("key", [""])[0] == MCP_SECRET
+    provided = query.get("key", [""])[0]
+    return hmac.compare_digest(provided, MCP_SECRET)
 
 
 def parse_exercise_routine() -> dict:
@@ -41,8 +66,8 @@ def parse_exercise_routine() -> dict:
 
 
 def get_health_data(date_key: str) -> dict:
-    data = redis.get(f"health:{date_key}")
-    return json.loads(data) if data else {}
+    raw = redis.hgetall(f"health:{date_key}") or {}
+    return {field: json.loads(value) for field, value in raw.items()}
 
 
 def get_cumulative_total(metric_data: dict) -> int:
@@ -74,26 +99,34 @@ def extract_day_metrics(data: dict) -> dict:
     metrics = {}
 
     # HRV
-    if "hrv" in data and data["hrv"].get("avg"):
+    if "hrv" in data and data["hrv"].get("avg") is not None:
         metrics["hrv"] = round(data["hrv"]["avg"], 1)
 
     # Heart rate
     if "heartRate" in data:
         hr = data["heartRate"]
-        if hr.get("min"):
+        if hr.get("min") is not None:
             metrics["resting_hr"] = round(hr["min"], 1)
         if "hr_zones" in hr and hr["hr_zones"].get("zone_pct"):
             metrics["hr_zones"] = hr["hr_zones"]["zone_pct"]
 
+    # Prefer a dedicated resting-HR reading (e.g. from Health Auto Export) over
+    # the derived min-of-samples value above, when both are present.
+    if "restingHR" in data and data["restingHR"].get("avg") is not None:
+        metrics["resting_hr"] = round(data["restingHR"]["avg"], 1)
+
     # Sleep
     if "sleep" in data:
         sleep = data["sleep"]
-        metrics["sleep"] = {
-            "quality": sleep.get("quality"),
-            "fragmentation_pct": sleep.get("fragmentation_pct"),
-            "has_deep": sleep.get("has_deep"),
-            "has_rem": sleep.get("has_rem")
-        }
+        if sleep.get("unrecognized"):
+            metrics["sleep"] = {"quality": None, "note": "sleep stages not recognized in raw samples"}
+        else:
+            metrics["sleep"] = {
+                "quality": sleep.get("quality"),
+                "fragmentation_pct": sleep.get("fragmentation_pct"),
+                "has_deep": sleep.get("has_deep"),
+                "has_rem": sleep.get("has_rem")
+            }
 
     # Exercise minutes
     exercise_key = get_exercise_key(data)
@@ -113,7 +146,7 @@ def extract_day_metrics(data: dict) -> dict:
         metrics["mindful_min"] = get_cumulative_total(data["mindful"])
 
     # Respiratory rate
-    if "respRate" in data and data["respRate"].get("avg"):
+    if "respRate" in data and data["respRate"].get("avg") is not None:
         metrics["respiratory_rate"] = round(data["respRate"]["avg"], 1)
 
     return metrics if metrics else None
@@ -121,11 +154,12 @@ def extract_day_metrics(data: dict) -> dict:
 
 def get_hrv_baseline(days: int = 14) -> dict:
     """Calculate HRV baseline from recent history."""
+    days = clamp_days(days)
     hrv_values = []
     for i in range(1, days + 1):
-        date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        date = (local_now() - timedelta(days=i)).strftime("%Y-%m-%d")
         data = get_health_data(date)
-        if data and "hrv" in data and data["hrv"].get("avg"):
+        if data and "hrv" in data and data["hrv"].get("avg") is not None:
             hrv_values.append(data["hrv"]["avg"])
     if not hrv_values:
         return {"baseline": None, "days": 0}
@@ -139,7 +173,7 @@ def get_hrv_baseline(days: int = 14) -> dict:
 
 def tool_get_today() -> str:
     """Get all raw health metrics for today."""
-    date_key = datetime.now().strftime("%Y-%m-%d")
+    date_key = local_now().strftime("%Y-%m-%d")
     data = get_health_data(date_key)
     if not data:
         return json.dumps({"error": "No data synced today. Run iOS shortcuts."})
@@ -148,9 +182,10 @@ def tool_get_today() -> str:
 
 def tool_get_trends(days: int = 7) -> str:
     """Get health metrics over multiple days."""
+    days = clamp_days(days)
     results = {}
     for i in range(days):
-        date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        date = (local_now() - timedelta(days=i)).strftime("%Y-%m-%d")
         data = get_health_data(date)
         metrics = extract_day_metrics(data)
         if metrics:
@@ -162,7 +197,7 @@ def tool_get_trends(days: int = 7) -> str:
 
 def tool_get_recovery_status() -> str:
     """Get recovery status with baseline comparisons and recent history."""
-    date_key = datetime.now().strftime("%Y-%m-%d")
+    date_key = local_now().strftime("%Y-%m-%d")
     data = get_health_data(date_key)
     baseline = get_hrv_baseline()
 
@@ -189,7 +224,7 @@ def tool_get_recovery_status() -> str:
     # Recent days for pattern analysis
     recent_days = {}
     for i in range(1, 4):
-        day_key = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        day_key = (local_now() - timedelta(days=i)).strftime("%Y-%m-%d")
         day_data = get_health_data(day_key)
         metrics = extract_day_metrics(day_data)
         if metrics:
@@ -214,7 +249,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "days": {"type": "integer", "description": "Number of days (default 7)"}
+                "days": {"type": "integer", "description": "Number of days (default 7, max 90)"}
             },
             "required": []
         }
@@ -251,7 +286,7 @@ class handler(BaseHTTPRequestHandler):
         self.send_json({
             "name": "health",
             "version": "1.0.0",
-            "description": "Personal health data from Apple Watch via iOS Shortcuts",
+            "description": "Personal health data from Apple Watch via iOS Shortcuts / Health Auto Export",
             "tools": TOOLS
         })
 

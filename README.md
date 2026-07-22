@@ -54,8 +54,9 @@ Claude sees all your metrics: HRV, resting HR, HR zones, sleep (quality, fragmen
 |----------|------------|
 | `UPSTASH_REDIS_REST_URL` | From Upstash dashboard |
 | `UPSTASH_REDIS_REST_TOKEN` | From Upstash dashboard |
-| `API_KEY` | Run `openssl rand -hex 32` |
-| `MCP_SECRET` | Run `openssl rand -hex 16` |
+| `API_KEY` | Required. Run `openssl rand -hex 32`. Endpoints refuse all requests if unset. |
+| `MCP_SECRET` | Required. Run `openssl rand -hex 16`. Endpoint refuses all requests if unset. |
+| `TIMEZONE` | Optional, defaults to `UTC`. Your IANA timezone (e.g. `America/Sao_Paulo`), so "today"/"yesterday" match your local calendar day instead of the server's UTC clock. |
 | `EXERCISE_DAYS_PER_WEEK` | Optional. e.g., `strength:4,yoga:7,cardio:2` |
 
 4. Deploy. That's it.
@@ -131,6 +132,8 @@ Create a master shortcut that calls all your sub-shortcuts in sequence. This is 
 You can schedule the master shortcut to run daily. Go to Shortcuts → Automation → Create Personal Automation → Time of Day.
 
 **Important limitation:** iOS requires confirmation for health data access. The automation will prompt you to tap "Run" each morning. It cannot run fully automatically. Your phone must be unlocked, and you cannot trigger it from your Apple Watch.
+
+**Want to skip the daily tap?** This is an iOS restriction on Shortcuts specifically ("Find Health Samples" always forces a confirmation), not a limitation of this server. A real installed app like [Health Auto Export](https://www.healthyapps.dev/) requests HealthKit permission once, then syncs in the background via Apple's native `HKObserverQuery`/background-delivery APIs — no daily confirmation. `/api/ingest` accepts Health Auto Export's REST API JSON export directly (in addition to the Shortcuts form-encoded body): point its REST API automation at `https://your-app.vercel.app/api/ingest` with header `Authorization: Bearer YOUR_API_KEY`, on a daily schedule. The metric-name mapping (`HAE_METRIC_MAP` in `api/ingest.py`) was reverse-engineered from public examples, not an official schema. **Treat the parsed HAE numbers as unverified until you check them**: every JSON payload received is also stored raw under `_debug_raw_hae` for that day (even when metrics do map), specifically because a wrong-but-plausible mapping (e.g. cumulative metrics assuming Shortcuts' single-daily-value shape, sleep stages counted by occurrence instead of duration) would otherwise compute silently-wrong numbers with no error. Compare `_debug_raw_hae` against the computed metrics for a day or two before trusting `get_recovery_status` on HAE-sourced data, and adjust `HAE_METRIC_MAP`/`parse_hae_metrics` if the shapes don't match.
 
 <details>
 <summary>Automation Setup</summary>
@@ -234,11 +237,11 @@ The magic is letting the LLM reason. It notices things like:
 
 ## Security
 
-`API_KEY` protects ingest, `MCP_SECRET` protects the MCP endpoint. Basic protection. If you leak a key, rotate it in Vercel and update your shortcuts.
+`API_KEY` protects ingest and `/api/data`, `MCP_SECRET` protects the MCP endpoint. Both are required — every endpoint fails closed (refuses all requests) if its secret isn't configured, and comparisons use `hmac.compare_digest` to avoid timing side-channels. If you leak a key, rotate it in Vercel and update your shortcuts/automation.
 
 ## Your Data
 
-Everything lives in your Upstash Redis. Nothing shared. Keys are `health:YYYY-MM-DD`.
+Everything lives in your Upstash Redis, one hash per day (`HSET health:YYYY-MM-DD <metric> <value>`), so concurrent writes from different metrics/shortcuts update independently instead of racing to overwrite a single blob. Nothing shared.
 
 ## Inspiration
 
