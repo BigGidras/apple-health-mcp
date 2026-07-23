@@ -102,27 +102,54 @@ def parse_values(raw: str) -> list:
     return values
 
 
-def parse_hae_metrics(payload: dict) -> dict:
-    """Map a Health Auto Export JSON export into {internal_key: [raw values]}."""
-    result = {}
-    metrics = payload.get("data", {}).get("metrics", [])
-    for metric in metrics:
+# Metrics whose HAE data points are disjoint aggregation buckets (e.g. hourly
+# windows) - the daily figure is the SUM of the buckets, unlike the Shortcuts
+# path where duplicate samples make max() the safer reduction.
+HAE_CUMULATIVE_KEYS = {"steps", "exercise", "activeEnergy"}
+
+
+def _hae_point_value(point: dict, internal_key: str):
+    """Extract a usable value from one HAE data point. Quantity metrics use
+    'qty'; heart-rate-style points use 'Avg'/'Min'/'Max' (confirmed against a
+    real captured payload); sleep uses 'value' stage strings when present."""
+    if internal_key == "sleep":
+        stage = point.get("value")
+        return str(stage) if stage else None
+    qty = point.get("qty")
+    if qty is not None:
+        return qty
+    return point.get("Avg")
+
+
+def _hae_point_day(point: dict, fallback_day: str) -> str:
+    """Day (YYYY-MM-DD) a data point belongs to, from its own timestamp
+    (format '2026-07-21 06:39:00 -0300'). Falls back to the receipt-day
+    bucket when the date is missing/unparsable."""
+    raw = str(point.get("date", ""))[:10]
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+        return raw
+    return fallback_day
+
+
+def parse_hae_metrics(payload: dict, fallback_day: str) -> dict:
+    """Map a Health Auto Export JSON export into {day: {internal_key: [values]}}.
+    Points are bucketed by their own timestamps - one export window can span
+    multiple calendar days."""
+    days = {}
+    for metric in payload.get("data", {}).get("metrics", []):
         internal_key = HAE_METRIC_MAP.get(metric.get("name", ""))
         if not internal_key:
             continue
-        values = []
         for point in metric.get("data", []):
-            if internal_key == "sleep":
-                stage = point.get("value")
-                if stage:
-                    values.append(str(stage))
-            else:
-                qty = point.get("qty")
-                if qty is not None:
-                    values.append(qty)
-        if values:
-            result[internal_key] = values
-    return result
+            value = _hae_point_value(point, internal_key)
+            if value is None:
+                continue
+            day = _hae_point_day(point, fallback_day)
+            days.setdefault(day, {}).setdefault(internal_key, []).append(value)
+    for day_metrics in days.values():
+        for key in HAE_CUMULATIVE_KEYS & set(day_metrics):
+            day_metrics[key] = [sum(day_metrics[key])]
+    return days
 
 
 def compute_hr_zones(values: list) -> dict:
@@ -271,37 +298,37 @@ class handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "invalid json"}, 400)
                 return
 
-            # HAE_METRIC_MAP is reverse-engineered, unconfirmed against a real
-            # payload - metrics that DO map (e.g. cumulative totals via max(),
-            # sleep stages via occurrence-count) can still compute wrong numbers
-            # silently. Always keep the raw payload for inspection, not just on
-            # a total mapping miss, so parsed values can be checked against it.
+            # Always keep the latest raw payload for inspection - a plausible-
+            # but-wrong mapping computes wrong numbers with no error, so the
+            # parsed values must be checkable against the source.
             redis.hset(redis_key, "_debug_raw_hae", json.dumps(payload))
 
-            metric_values = parse_hae_metrics(payload)
-            if not metric_values:
+            day_buckets = parse_hae_metrics(payload, date_key)
+            if not day_buckets:
                 self.send_json({
                     "ok": True,
-                    "note": "unrecognized JSON shape, stored raw for inspection",
-                    "top_level_keys": list(payload.keys())
+                    "note": "no mappable metrics in JSON payload, stored raw for inspection",
+                    "data_keys": list(payload.get("data", {}).keys()) or list(payload.keys())
                 })
                 return
         else:
             form_data = parse_qs(raw_body)
-            metric_values = {
+            day_buckets = {date_key: {
                 key: parse_values(values[0] if values else "")
                 for key, values in form_data.items()
-            }
+            }}
 
-        for key, values in metric_values.items():
-            stats = compute_stats(values, key)
-            redis.hset(redis_key, key, json.dumps(stats))
-        redis.hset(redis_key, "_updated", json.dumps(local_now().isoformat()))
+        written = {}
+        for day, metric_values in day_buckets.items():
+            day_key = f"health:{day}"
+            for key, values in metric_values.items():
+                redis.hset(day_key, key, json.dumps(compute_stats(values, key)))
+            redis.hset(day_key, "_updated", json.dumps(local_now().isoformat()))
+            written[day] = sorted(metric_values.keys())
 
         self.send_json({
             "ok": True,
-            "date": date_key,
-            "keys": list(metric_values.keys())
+            "days": written
         })
 
     def do_GET(self):
