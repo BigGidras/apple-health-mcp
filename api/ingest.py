@@ -113,14 +113,50 @@ HAE_CUMULATIVE_KEYS = {"steps", "exercise", "activeEnergy"}
 def _hae_point_value(point: dict, internal_key: str):
     """Extract a usable value from one HAE data point. Quantity metrics use
     'qty'; heart-rate-style points use 'Avg'/'Min'/'Max' (confirmed against a
-    real captured payload); sleep uses 'value' stage strings when present."""
-    if internal_key == "sleep":
-        stage = point.get("value")
-        return str(stage) if stage else None
+    real captured payload). Sleep is handled separately - see
+    compute_hae_sleep_stats - since HAE ships one aggregated per-night record,
+    not per-sample stage strings like the Shortcuts path."""
     qty = point.get("qty")
     if qty is not None:
         return qty
     return point.get("Avg")
+
+
+def compute_hae_sleep_stats(records: list) -> dict:
+    """Aggregate HAE's sleep_analysis night record(s) - already-summed hours
+    per stage (rem/core/deep/awake/totalSleep), confirmed against a real
+    payload - into the same output shape compute_sleep_stats produces from
+    Shortcuts' per-sample stage strings, so extract_day_metrics doesn't need
+    to know which source the data came from."""
+    rem = sum(r.get("rem") or 0 for r in records)
+    core = sum(r.get("core") or 0 for r in records)
+    deep = sum(r.get("deep") or 0 for r in records)
+    awake = sum(r.get("awake") or 0 for r in records)
+    in_bed = sum(r.get("inBed") or 0 for r in records)
+    asleep_total = rem + core + deep
+    if asleep_total == 0:
+        asleep_total = sum(r.get("asleep") or 0 for r in records)
+    total_sleep = sum(r.get("totalSleep") or 0 for r in records) or asleep_total
+
+    if total_sleep == 0:
+        return {"records": records, "unrecognized": True}
+
+    fragmentation = round(awake / (asleep_total + awake) * 100, 1) if (asleep_total + awake) else 0.0
+    quality = "good" if fragmentation < 20 and rem > 0 and deep > 0 else \
+              "fair" if fragmentation < 35 else "poor"
+
+    return {
+        "total_sleep_hours": round(total_sleep, 2),
+        "rem_hours": round(rem, 2),
+        "deep_hours": round(deep, 2),
+        "core_hours": round(core, 2),
+        "awake_hours": round(awake, 2),
+        "in_bed_hours": round(in_bed, 2),
+        "fragmentation_pct": fragmentation,
+        "quality": quality,
+        "has_rem": rem > 0,
+        "has_deep": deep > 0
+    }
 
 
 def _hae_point_day(point: dict, fallback_day: str) -> str:
@@ -145,10 +181,18 @@ def parse_hae_metrics(payload: dict, fallback_day: str) -> dict:
     it for the same day (seen in a real payload) and naive summing would
     double-count those steps."""
     days = {}
+    sleep_records = {}
     for metric in payload.get("data", {}).get("metrics", []):
         internal_key = HAE_METRIC_MAP.get(metric.get("name", ""))
         if not internal_key:
             continue
+
+        if internal_key == "sleep":
+            for point in metric.get("data", []):
+                day = _hae_point_day(point, fallback_day)
+                sleep_records.setdefault(day, []).append(point)
+            continue
+
         units = str(metric.get("units", ""))
         for point in metric.get("data", []):
             value = _hae_point_value(point, internal_key)
@@ -165,9 +209,16 @@ def parse_hae_metrics(payload: dict, fallback_day: str) -> dict:
                 src_sums[src] = src_sums.get(src, 0) + value
             else:
                 days.setdefault(day, {}).setdefault(internal_key, []).append(value)
+
     for day_metrics in days.values():
         for key in HAE_CUMULATIVE_KEYS & set(day_metrics):
             day_metrics[key] = [max(day_metrics[key].values())]
+
+    # Sleep stats are precomputed here (not left as a raw list) since HAE's
+    # night record needs its own aggregation, not compute_stats/compute_sleep_stats.
+    for day, records in sleep_records.items():
+        days.setdefault(day, {})["sleep"] = compute_hae_sleep_stats(records)
+
     return days
 
 
@@ -341,7 +392,12 @@ class handler(BaseHTTPRequestHandler):
         for day, metric_values in day_buckets.items():
             day_key = f"health:{day}"
             for key, values in metric_values.items():
-                redis.hset(day_key, key, json.dumps(compute_stats(values, key)))
+                # HAE sleep arrives pre-aggregated (see compute_hae_sleep_stats)
+                # rather than as a raw sample list - don't re-run it through
+                # compute_stats/compute_sleep_stats, which expects the
+                # Shortcuts stage-string shape.
+                stats = values if key == "sleep" and isinstance(values, dict) else compute_stats(values, key)
+                redis.hset(day_key, key, json.dumps(stats))
             redis.hset(day_key, "_updated", json.dumps(local_now().isoformat()))
             written[day] = sorted(metric_values.keys())
 

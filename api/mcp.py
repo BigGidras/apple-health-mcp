@@ -152,7 +152,12 @@ def extract_day_metrics(data: dict) -> dict:
                 "quality": sleep.get("quality"),
                 "fragmentation_pct": sleep.get("fragmentation_pct"),
                 "has_deep": sleep.get("has_deep"),
-                "has_rem": sleep.get("has_rem")
+                "has_rem": sleep.get("has_rem"),
+                # Only present for Health Auto Export-sourced records (hours);
+                # absent for older Shortcuts-sourced stage-count records.
+                "total_sleep_hours": sleep.get("total_sleep_hours"),
+                "deep_hours": sleep.get("deep_hours"),
+                "rem_hours": sleep.get("rem_hours")
             }
 
     # Exercise minutes
