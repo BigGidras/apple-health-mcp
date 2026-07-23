@@ -77,11 +77,15 @@ def local_now() -> datetime:
 
 
 def check_auth(headers) -> bool:
-    """Fail-closed: refuses every request if API_KEY isn't configured."""
+    """Fail-closed: refuses every request if API_KEY isn't configured.
+    Accepts the key with or without the 'Bearer ' prefix - phone-typed
+    header values often omit it."""
     if not API_KEY:
         return False
-    auth = headers.get("Authorization", "")
-    return hmac.compare_digest(auth, f"Bearer {API_KEY}")
+    auth = headers.get("Authorization", "").strip()
+    if auth.lower().startswith("bearer "):
+        auth = auth[7:].strip()
+    return hmac.compare_digest(auth, API_KEY)
 
 
 def parse_values(raw: str) -> list:
