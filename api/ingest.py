@@ -48,9 +48,10 @@ def redis_env_names() -> list:
 _redis_url, _redis_token = resolve_redis_env()
 redis = Redis(url=_redis_url, token=_redis_token) if _redis_url and _redis_token else None
 
-# Health Auto Export has no published schema; this mapping is reverse-engineered
-# from community examples. Confirm against a real captured payload (see the
-# "unrecognized JSON shape" branch below) and adjust if field names differ.
+# Metric names confirmed against a real captured Health Auto Export payload
+# (jul/2026) except respiratory_rate, mindful_minutes and sleep_analysis,
+# which had no data in the capture window - the raw payload is always stored
+# under _debug_raw_hae, so verify those three when they first arrive.
 HAE_METRIC_MAP = {
     "heart_rate": "heartRate",
     "heart_rate_variability": "hrv",
@@ -131,24 +132,41 @@ def _hae_point_day(point: dict, fallback_day: str) -> str:
     return fallback_day
 
 
+KJ_TO_KCAL = 0.239006
+
+
 def parse_hae_metrics(payload: dict, fallback_day: str) -> dict:
     """Map a Health Auto Export JSON export into {day: {internal_key: [values]}}.
     Points are bucketed by their own timestamps - one export window can span
-    multiple calendar days."""
+    multiple calendar days. Cumulative metrics are summed per (day, source)
+    and the largest single-source total wins: HAE usually ships Health's
+    already-merged series, but a stray device-only series can appear alongside
+    it for the same day (seen in a real payload) and naive summing would
+    double-count those steps."""
     days = {}
     for metric in payload.get("data", {}).get("metrics", []):
         internal_key = HAE_METRIC_MAP.get(metric.get("name", ""))
         if not internal_key:
             continue
+        units = str(metric.get("units", ""))
         for point in metric.get("data", []):
             value = _hae_point_value(point, internal_key)
             if value is None:
                 continue
+            # HAE exports active energy in kilojoules; everything downstream
+            # (and the README's reasoning prompts) treats it as kcal.
+            if internal_key == "activeEnergy" and units.lower() == "kj":
+                value *= KJ_TO_KCAL
             day = _hae_point_day(point, fallback_day)
-            days.setdefault(day, {}).setdefault(internal_key, []).append(value)
+            if internal_key in HAE_CUMULATIVE_KEYS:
+                src_sums = days.setdefault(day, {}).setdefault(internal_key, {})
+                src = str(point.get("source", ""))
+                src_sums[src] = src_sums.get(src, 0) + value
+            else:
+                days.setdefault(day, {}).setdefault(internal_key, []).append(value)
     for day_metrics in days.values():
         for key in HAE_CUMULATIVE_KEYS & set(day_metrics):
-            day_metrics[key] = [sum(day_metrics[key])]
+            day_metrics[key] = [max(day_metrics[key].values())]
     return days
 
 
