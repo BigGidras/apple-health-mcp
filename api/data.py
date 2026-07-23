@@ -68,7 +68,8 @@ def check_auth(headers) -> bool:
         return False
     auth = headers.get("Authorization", "").strip()
     if auth.lower().startswith("bearer "):
-        auth = auth[7:].strip()
+        auth = auth[7:]
+    auth = "".join(auth.split())
     return hmac.compare_digest(auth, API_KEY)
 
 

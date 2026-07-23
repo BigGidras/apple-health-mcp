@@ -67,11 +67,13 @@ def clamp_days(days: int, maximum: int = MAX_DAYS) -> int:
 
 
 def check_secret(path: str) -> bool:
-    """Fail-closed: refuses every request if MCP_SECRET isn't configured."""
+    """Fail-closed: refuses every request if MCP_SECRET isn't configured.
+    Whitespace inside the provided key is stripped - hex keys never contain
+    spaces, so any are copy/paste artifacts (seen as %20%20%20 in real logs)."""
     if not MCP_SECRET:
         return False
     query = parse_qs(urlparse(path).query)
-    provided = query.get("key", [""])[0]
+    provided = "".join(query.get("key", [""])[0].split())
     return hmac.compare_digest(provided, MCP_SECRET)
 
 
